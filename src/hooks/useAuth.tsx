@@ -1,0 +1,280 @@
+import React, { createContext, useContext, useState, useEffect } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { authAPI, tokenStorage, User, UserSettings } from "@/lib/auth";
+import { useToast } from "@/hooks/use-toast";
+import { SessionManager } from "@/lib/sessionManager";
+import { AuthUtils } from "@/lib/authUtils";
+
+interface AuthContextType {
+  user: User | null;
+  settings: UserSettings | null;
+  isLoading: boolean;
+  isAuthenticated: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  register: (email: string, password: string, firstName?: string, lastName?: string) => Promise<void>;
+  logout: () => void;
+  updateSettings: (settings: Partial<UserSettings>) => Promise<void>;
+  extendSession: () => void;
+  hasPermission: (requiredRole?: string) => boolean;
+  getUserDisplayName: () => string;
+  getUserInitials: () => string;
+  refreshUser: () => Promise<void>;
+  updateUserSession: (user: User) => void;
+}
+
+const AuthContext = createContext<AuthContextType | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [token, setToken] = useState<string | null>(() => {
+    // Try session manager first, fallback to legacy token storage
+    return SessionManager.getToken() || tokenStorage.get();
+  });
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+
+  // Initialize session on mount with validation
+  useEffect(() => {
+    console.log("🔧 Initializing auth session on mount");
+    const session = SessionManager.getSession();
+    console.log("🔧 Session found:", !!session);
+    
+    if (session && SessionManager.isValidSession()) {
+      console.log("🔧 Valid session found, setting token");
+      setToken(session.token);
+    } else {
+      console.log("🔧 No valid session, clearing auth data");
+      // Clear invalid or missing session
+      setToken(null);
+      AuthUtils.clearAllAuthData();
+      
+      // Try legacy token migration only if we have both token and user
+      const legacyToken = tokenStorage.get();
+      const user = SessionManager.getUser();
+      console.log("🔧 Legacy migration check:", { hasLegacyToken: !!legacyToken, hasUser: !!user });
+      if (legacyToken && user) {
+        console.log("🔧 Migrating legacy token to session");
+        SessionManager.createSession(legacyToken, user);
+        setToken(legacyToken);
+      }
+    }
+  }, []);
+
+  const { data: profileData, isLoading } = useQuery({
+    queryKey: ["/api/user/profile", token],
+    queryFn: async () => {
+      if (!token) return null;
+      try {
+        return await authAPI.getProfile(token);
+      } catch (error) {
+        // Clear auth data on profile fetch failure
+        console.debug("Profile fetch failed, clearing auth data:", error);
+        setToken(null);
+        AuthUtils.clearAllAuthData();
+        return null;
+      }
+    },
+    enabled: !!token,
+    retry: false,
+  });
+
+  const loginMutation = useMutation({
+    mutationFn: ({ email, password }: { email: string; password: string }) =>
+      authAPI.login(email, password),
+    onSuccess: (data: any) => {
+      setToken(data.token);
+      // Create session with user data
+      SessionManager.createSession(data.token, data.user);
+      tokenStorage.set(data.token); // Keep legacy support
+      queryClient.invalidateQueries({ queryKey: ["/api/user/profile"] });
+      
+      // Don't auto-redirect, let login page handle it
+      // const redirectUrl = sessionStorage.getItem('redirectAfterLogin') || '/dashboard';
+      // sessionStorage.removeItem('redirectAfterLogin');
+      // window.location.href = redirectUrl;
+      
+      toast({
+        title: "Login successful",
+        description: "Welcome back!",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Login failed",
+        description: error.message || "Invalid credentials",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const registerMutation = useMutation({
+    mutationFn: ({ email, password, firstName, lastName }: {
+      email: string;
+      password: string;
+      firstName?: string;
+      lastName?: string;
+    }) => authAPI.register(email, password, firstName, lastName),
+    onSuccess: (data: any) => {
+      setToken(data.token);
+      // Create session with user data
+      SessionManager.createSession(data.token, data.user);
+      tokenStorage.set(data.token); // Keep legacy support
+      queryClient.invalidateQueries({ queryKey: ["/api/user/profile"] });
+      
+      // Role-based redirect after registration (most new users are not admins, but handle edge cases)
+      const storedRedirect = sessionStorage.getItem('redirectAfterLogin');
+      const targetUrl = AuthUtils.getPostAuthRedirect(data.user, storedRedirect || undefined);
+      if (storedRedirect) {
+        sessionStorage.removeItem('redirectAfterLogin');
+      }
+      window.location.href = targetUrl;
+      
+      toast({
+        title: "Registration successful",
+        description: "Welcome to Proud Profits!",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Registration failed",
+        description: error.message || "Failed to create account",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const updateSettingsMutation = useMutation({
+    mutationFn: (settings: Partial<UserSettings>) =>
+      token ? authAPI.updateSettings(token, settings) : Promise.reject("No token"),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/user/profile"] });
+      toast({
+        title: "Settings updated",
+        description: "Your preferences have been saved",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Update failed",
+        description: error.message || "Failed to update settings",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const login = async (email: string, password: string) => {
+    console.log('Login attempt:', { email, password: password.replace(/./g, '*'), mode: 'login' });
+    console.log('Calling login function with:', { email, password: password.substring(0, 3) + '*'.repeat(password.length - 3) });
+    try {
+      const result = await loginMutation.mutateAsync({ email, password });
+      console.log('Login result:', result);
+      return result;
+    } catch (error) {
+      console.error('Full authentication error:', error);
+      console.error('Error message:', error instanceof Error ? error.message : 'Unknown error');
+      console.error('Error status:', (error as any)?.status || null);
+      console.error('Error code:', (error as any)?.code || null);
+      throw error;
+    }
+  };
+
+  const register = async (email: string, password: string, firstName?: string, lastName?: string) => {
+    await registerMutation.mutateAsync({ email, password, firstName, lastName });
+  };
+
+  const logout = () => {
+    AuthUtils.logSecurityEvent('USER_LOGOUT', { userId: profileData?.user?.id });
+    setToken(null);
+    AuthUtils.clearAllAuthData();
+    queryClient.clear();
+    toast({
+      title: "Logged out",
+      description: "You have been logged out successfully",
+    });
+    // Redirect to login page
+    window.location.href = '/login';
+  };
+
+  const extendSession = () => {
+    SessionManager.extendSession();
+    AuthUtils.logSecurityEvent('SESSION_EXTENDED', { userId: profileData?.user?.id });
+    toast({
+      title: "Session extended",
+      description: "Your session has been extended",
+    });
+  };
+
+  const hasPermission = (requiredRole?: string) => {
+    return AuthUtils.hasPermission(profileData?.user, requiredRole);
+  };
+
+  const getUserDisplayName = () => {
+    return AuthUtils.getUserDisplayName(profileData?.user);
+  };
+
+  const getUserInitials = () => {
+    return AuthUtils.getUserInitials(profileData?.user);
+  };
+
+  const updateSettings = async (settings: Partial<UserSettings>) => {
+    await updateSettingsMutation.mutateAsync(settings);
+  };
+
+  // Function to refresh user data after subscription changes
+  const refreshUser = async () => {
+    if (token) {
+      await queryClient.invalidateQueries({ queryKey: ["/api/user/profile", token] });
+      await queryClient.refetchQueries({ queryKey: ["/api/user/profile", token] });
+    }
+  };
+
+  // Function to update user data in session after subscription change
+  const updateUserSession = (updatedUser: User) => {
+    if (token) {
+      SessionManager.createSession(token, updatedUser);
+    }
+  };
+
+  // Clear auth data if token exists but profile fetch failed
+  useEffect(() => {
+    if (token && !isLoading && !profileData?.user) {
+      console.debug("Token exists but no valid user profile, clearing auth data");
+      setToken(null);
+      AuthUtils.clearAllAuthData();
+    }
+  }, [token, isLoading, profileData?.user]);
+
+  // Only use server-verified user, not cached user
+  const authUser = profileData?.user || null;
+  const isAuthenticated = !!token && !!authUser;
+
+  const contextValue: AuthContextType = {
+    user: authUser,
+    settings: profileData?.settings || null,
+    isLoading: isLoading || loginMutation.isPending || registerMutation.isPending,
+    isAuthenticated,
+    login,
+    register,
+    logout,
+    updateSettings,
+    extendSession,
+    hasPermission,
+    getUserDisplayName,
+    getUserInitials,
+    refreshUser,
+    updateUserSession,
+  };
+
+  return (
+    <AuthContext.Provider value={contextValue}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth(): AuthContextType {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error("useAuth must be used within an AuthProvider");
+  }
+  return context;
+}
